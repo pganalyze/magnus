@@ -37,6 +37,8 @@ pub fn expand_derive_typed_data(input: DeriveInput) -> Result<TokenStream, Error
     let mut wb_protected = false;
     let mut frozen_shareable = false;
     let mut unsafe_generics = false;
+    let mut accessors = false;
+    let mut bindings = false;
 
     attrs.parse_nested_meta(|meta| {
         if meta.path.is_ident("class") {
@@ -65,6 +67,12 @@ pub fn expand_derive_typed_data(input: DeriveInput) -> Result<TokenStream, Error
             Ok(())
         } else if meta.path.is_ident("unsafe_generics") {
             unsafe_generics = true;
+            Ok(())
+        } else if meta.path.is_ident("accessors") {
+            accessors = true;
+            Ok(())
+        } else if meta.path.is_ident("bindings") {
+            bindings = true;
             Ok(())
         } else if meta.path.is_ident("free_immediatly") {
             Err(meta.error("unsupported attribute (use free_immediately)"))
@@ -149,44 +157,102 @@ pub fn expand_derive_typed_data(input: DeriveInput) -> Result<TokenStream, Error
         quote! {}
     };
 
-    let mut accessors = Vec::new();
+    let mut accessor_fns = Vec::new();
     if let Data::Struct(DataStruct {
         fields: Fields::Named(FieldsNamed { ref named, .. }),
         ..
     }) = input.data
     {
         for field in named {
-            let attrs = match util::get_magnus_attribute(&field.attrs)? {
-                Some(v) => v,
-                None => continue,
+            let mut opaque_attr_reader = false;
+            if let Some(attrs) = util::get_magnus_attribute(&field.attrs)? {
+                attrs.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("opaque_attr_reader") {
+                        opaque_attr_reader = true;
+                        Ok(())
+                    } else {
+                        Err(meta.error("unsupported attribute"))
+                    }
+                })?;
             };
-            let mut read = false;
-            attrs.parse_nested_meta(|meta| {
-                if meta.path.is_ident("opaque_attr_reader") {
-                    read = true;
-                    Ok(())
-                } else {
-                    Err(meta.error("unsupported attribute"))
-                }
-            })?;
             let ident = field.ident.as_ref().unwrap();
             let ty = &field.ty;
-            if read {
-                accessors.push(quote! {
+            if opaque_attr_reader {
+                accessor_fns.push(quote! {
                     #[inline]
                     fn #ident(&self) -> <#ty as magnus::value::OpaqueVal>::Val {
-                        let handle = magnus::Ruby::get().unwrap();
-                        handle.get_inner(self.#ident)
+                        let ruby = unsafe { magnus::Ruby::get_unchecked() };
+                        ruby.get_inner(self.#ident)
+                    }
+                });
+            } else if accessors {
+                accessor_fns.push(match quote! { #ty }.to_string().as_str() {
+                    ty if ty.starts_with("Vec") => quote! {
+                        #[inline]
+                        fn #ident(&self) -> magnus::RArray {
+                            let ruby = unsafe { magnus::Ruby::get_unchecked() };
+                            ruby.ary_from_vec(self.#ident.clone())
+                        }
+                    },
+                    "Uuid" => quote! {
+                        #[inline]
+                        fn #ident(&self) -> String {
+                            self.#ident.to_string()
+                        }
+                    },
+                    _ => quote! {
+                        #[inline]
+                        fn #ident(&self) -> #ty {
+                            self.#ident.clone()
+                        }
                     }
                 });
             }
         }
     }
+    let accessor_impl = quote! {
+        impl #ident {
+            #(#accessor_fns)*
+        }
+    };
 
-    let accessor_impl = if !accessors.is_empty() {
+    let bindings_impl = if bindings {
+        let mut modules: Vec<_> = class.split("::").collect();
+        let class = modules.pop().unwrap();
+        let modules: Vec<_> = modules
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let var = if i == 0 {
+                    quote! { ruby }
+                } else {
+                    quote! { module }
+                };
+                quote! { let module = #var.define_module(#m)?; }
+            })
+            .collect();
+        let mut accessor_bindings = Vec::new();
+        if let Data::Struct(DataStruct {
+            fields: Fields::Named(FieldsNamed { ref named, .. }),
+            ..
+        }) = input.data
+        {
+            for field in named {
+                let name = field.ident.as_ref().unwrap();
+                accessor_bindings.push(quote! {
+                    class.define_method(stringify!(#name), magnus::method!(#ident::#name, 0))?;
+                });
+            }
+        }
         quote! {
+            use magnus::Module as _;
             impl #ident {
-                #(#accessors)*
+                pub fn bindings(ruby: &magnus::Ruby) -> Result<(), magnus::Error> {
+                    #(#modules)*
+                    let class = module.define_class(#class, ruby.class_object())?;
+                    #(#accessor_bindings)*
+                    Ok(())
+                }
             }
         }
     } else {
@@ -217,6 +283,7 @@ pub fn expand_derive_typed_data(input: DeriveInput) -> Result<TokenStream, Error
     let builder = builder.into_iter().collect::<TokenStream>();
     let tokens = quote! {
         #accessor_impl
+        #bindings_impl
 
         unsafe impl #generics magnus::TypedData for #ident #generics {
             fn class(ruby: &magnus::Ruby) -> magnus::RClass {
